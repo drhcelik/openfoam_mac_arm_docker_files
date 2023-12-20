@@ -1,0 +1,216 @@
+#!/bin/bash
+#------------------------------------------------------------------------------
+# =========                 |
+# \\      /  F ield         | OpenFOAM: The Open Source CFD Toolbox
+#  \\    /   O peration     |
+#   \\  /    A nd           | Copyright (C) 2017 OpenFOAM Foundation
+#    \\/     M anipulation  |
+#-------------------------------------------------------------------------------
+# License
+#     This program is free software: you can redistribute it and/or modify it
+#     under the terms of the GNU General Public License as published by
+#     the Free Software Foundation, either version 3 of the License, or
+#     (at your option) any later version.
+#
+#     This program is distributed in the hope that it will be useful, but
+#     WITHOUT ANY WARRANTY; without even the implied warranty of MERCHANTABILITY
+#     or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU General Public License
+#     for more details.
+#
+#     You should have received a copy of the GNU General Public License
+#     along with OpenFOAM.  If not, see <http://www.gnu.org/licenses/>.
+#
+# Script
+#     openfoam-macos-file-system
+#
+# Description
+#     Creates a disk image with a case-sensitive filing system on a macOS
+#     formatted disk (with a case-insensitive filing system)
+#
+#------------------------------------------------------------------------------
+Script=${0##*/}
+
+usage () {
+    exec 1>&2
+    while [ "$#" -ge 1 ]; do echo "$1"; shift; done
+    cat <<USAGE
+
+Usage: ${0##*/} [OPTIONS] <command>
+
+commands:
+  create       Initialize case-sensitive volume (only needed first time)
+  automount    Configure macOS to mount the volume automatically on restart
+  mount        Attach the case-sensitive volume
+  unmount      Detach the case-sensitive volume
+  compact      Remove any uneeded reserved space in the volume
+  delete       Delete the disk image
+
+options:
+  -d | -dir <dir>      mount directory, default "$HOME/<volume-name>"
+  -h | -help           help
+  -n | -no-run         do not create the "run" directory
+  -s | -size <size>    size of volume in GB, default 10, minimum 2
+  -v | -volume <name>  name of volume, default "openfoam"
+
+Creates a volume (disk image) with a case-sensitive filing system on a
+macOS formatted disk (with a case-insensitive filing system) for use with
+the Docker builds of OpenFOAM for macOS: http://openfoam.org/version/macos
+
+Commands exist to create, mount, unmount, delete and compact the volume, and
+to mount it automatically when the machine starts up.
+
+By default, the volume is named "openfoam" with size of 10GB, mounted at
+"\$HOME/openfoam", and includes a "run" directory corresponding to the
+\$FOAM_RUN environment variable in the Docker container.  There are options to
+override all these defaults.
+
+USAGE
+    exit 1
+}
+
+create() {
+    hdiutil create \
+        -type SPARSE \
+        -fs 'Case-sensitive Journaled HFS+' \
+        -size ${VOLUME_SIZE}g \
+        -volname ${VOLUME} \
+        ${WORKSPACE}
+}
+
+automount() {
+    attach
+    cat << EOF > /tmp/com.workspace.plist
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+    <dict>
+        <key>RunAtLoad</key>
+        <true/>
+        <key>Label</key>
+        <string>com.workspace</string>
+        <key>ProgramArguments</key>
+        <array>
+            <string>hdiutil</string>
+            <string>attach</string>
+            <string>-notremovable</string>
+            <string>-nobrowse</string>
+            <string>-mountpoint</string>
+            <string>${MOUNT_DIR}</string>
+            <string>${WORKSPACE}</string>
+        </array>
+    </dict>
+</plist>
+EOF
+    sudo cp /tmp/com.workspace.plist /Library/LaunchDaemons/com.workspace.plist
+    rm /tmp/com.workspace.plist
+}
+
+detach() {
+    MOUNTED=$(hdiutil info | grep "${MOUNT_DIR}" | cut -f1)
+    [ "$MOUNTED" ] && \
+        sudo hdiutil detach $MOUNTED || \
+        usage "Volume is not currently mounted at ${MOUNT_DIR}"
+}
+
+attach() {
+    MOUNTED=$(hdiutil info | grep "${MOUNT_DIR}" | cut -f1)
+    [ "$MOUNTED" ] && \
+        usage "Volume is already mounted at ${MOUNT_DIR}"
+    if [ -d "$MOUNT_DIR" ]
+    then
+        [ "$(ls -A $MOUNT_DIR)" ] && \
+            usage "Mount directory is not empty, exiting"
+    else
+        mkdir -p $MOUNT_DIR
+    fi
+    sudo hdiutil attach -mountpoint ${MOUNT_DIR} ${WORKSPACE}
+    RUN=$MOUNT_DIR/run
+    [ -d "$RUN" -o "$NO_RUN" ] || mkdir $RUN
+}
+
+compact() {
+    detach
+    hdiutil compact ${WORKSPACE} -batteryallowed
+    attach
+}
+
+confirm () {
+    read -r -p "$* " response
+    case $response in
+         [yY][eE][sS]|[yY])
+            true
+            ;;
+        *)
+            false
+            ;;
+    esac
+}
+
+delete() {
+    confirm "This operation will delete ALL FILES on disk image ${VOLUME}." \
+            "Are you sure? (y/N)" && \
+        echo "Detaching $VOLUME" && detach && \
+        echo "Deleting $VOLUME" && rm ${WORKSPACE}
+}
+
+# ARGUMENT HANDLING
+VOLUME=openfoam
+VOLUME_SIZE=10
+
+while [ "$#" -gt 0 ]
+do
+   case "$1" in
+   -d | -dir)
+      [ "$#" -ge 2 ] || usage "'$1' option requires an argument"
+      MOUNT_DIR=$2
+      shift 2
+      ;;
+   -h | -help)
+      usage
+      ;;
+   -n | -no-run)
+      NO_RUN="yes"
+      shift
+      ;;
+   -s | -size)
+      [ "$#" -ge 2 ] || usage "'$1' option requires an argument"
+      VOLUME_SIZE=$2
+      [ "$VOLUME_SIZE" -eq "$VOLUME_SIZE" ] || \
+          usage "Specified volume size, in GB, must be an integer, e.g. \"-s 20\""
+      [ "$VOLUME_SIZE" -lt 2 ] || \
+          usage "Specified volume size, in GB, must be greater than 2 (GB)"
+      shift 2
+      ;;
+   -v | -volume)
+      [ "$#" -ge 2 ] || usage "'$1' option requires an argument"
+      VOLUME=$2
+      shift 2
+      ;;
+   -*)
+      usage "Invalid option '$1'"
+      ;;
+   *)
+      break
+      ;;
+    esac
+done
+
+[ "$#" -eq 1 ] || usage "Script requires 1 command, e.g. \"$Script create\""
+
+case "$1" in
+    create)    CMD=create ;;
+    automount) CMD=automount ;;
+    mount)     CMD=attach ;;
+    unmount)   CMD=detach ;;
+    compact)   CMD=compact ;;
+    delete)    CMD=delete ;;
+    *)         usage "$1 is not a valid command" ;;
+esac
+
+WORKSPACE=${HOME}/.${VOLUME}.dmg.sparseimage
+[ "$MOUNT_DIR" ] || MOUNT_DIR=${HOME}/${VOLUME}
+
+# Run the command
+echo $CMD
+
+$CMD

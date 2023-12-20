@@ -1,0 +1,213 @@
+#!/bin/sh
+#------------------------------------------------------------------------------
+# =========                 |
+# \\      /  F ield         | OpenFOAM: The Open Source CFD Toolbox
+#  \\    /   O peration     |
+#   \\  /    A nd           | Copyright (C) 2017-2023 OpenFOAM Foundation
+#    \\/     M anipulation  |
+#-------------------------------------------------------------------------------
+# License
+#     This program is free software: you can redistribute it and/or modify it
+#     under the terms of the GNU General Public License as published by
+#     the Free Software Foundation, either version 3 of the License, or
+#     (at your option) any later version.
+#
+#     This program is distributed in the hope that it will be useful, but
+#     WITHOUT ANY WARRANTY; without even the implied warranty of MERCHANTABILITY
+#     or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU General Public License
+#     for more details.
+#
+#     You should have received a copy of the GNU General Public License
+#     along with OpenFOAM.  If not, see <http://www.gnu.org/licenses/>.
+#
+# Script
+#     openfoam10-macos
+#
+# Description
+#     Run script for an OpenFOAM 10 Docker image at:
+#     https://hub.docker.com/r/openfoam
+#
+#------------------------------------------------------------------------------
+Script=${0##*/}
+ver=10
+
+usage () {
+    exec 1>&2
+    while [ "$#" -ge 1 ]; do echo "$1"; shift; done
+    cat <<USAGE
+
+Usage: ${0##*/} [OPTIONS]
+options:
+  -d | -dir             host directory mounted (defaults to current directory)
+  -h | -help            help
+  -p | -paraview [vers] include paraview, with version 56 | 510 (default)      
+  -u | -upgrade         install latest upgrades to the Docker image
+  -x | -xhost           use custom X authority and give container host network
+
+Launches the OpenFOAM-$ver Docker image.
+- Requires installation of docker-engine.
+- Runs a "containerized" bash shell environment where the user can run OpenFOAM
+  and, optionally, ParaView (see below).
+- The container mounts the user's file system so that case files are stored
+  permanently.  The container mounts the current directory by default, but the
+  user can also specify a particular directory using the "-d" option.
+- Mounting the user's HOME directory is disallowed.
+- The '-xhost' option is useful when accessing the host via 'ssh -X'.
+  This option should only be used when strictly necessary, as it relies on the
+  option '--net=host' when launching the container in Docker, which will
+  give to the container full access to the Docker host network stack and
+  potentially the host's system services that rely on network communication,
+  making it potentially insecure.
+
+ParaView:
+Graphical applications from the Docker container require installation of the
+Xquartz X server to display on the host machine.  While applications such as
+Gedit, Emacs and GnuPlot will run effectively using Xquartz, more intensive
+OpenGL applications, in particular ParaView, can be prohibitively slow.
+
+Therefore, the default Docker image does not contain ParaView and users can
+instead install ParaView directly from the vendor and use the built-in reader
+module for OpenFOAM: https://www.paraview.org/download
+
+However, if the user wishes to include ParaView with the official OpenFOAM
+reader module in their Docker container, they can do so with the "-p" option.
+
+Example:
+To store data in $HOME/OpenFOAM/$USER-$ver, the user can launch
+$Script either by:
+    cd $HOME/OpenFOAM/$USER-$ver && $Script
+or
+    $Script -d $HOME/OpenFOAM/$USER-$ver
+
+Further Information:
+https://openfoam.org/download/$ver-macos
+
+Note:
+The container user name appears as "openfoam" but it is just an alias.
+
+USAGE
+    exit 1
+}
+
+docker_image='openfoam/openfoam10-graphical-apps'
+paraview_vers=""
+mount_dir=$(pwd)
+custom_xauth=""
+docker_options=""
+
+while [ "$#" -gt 0 ]
+do
+   case "$1" in
+   -d | -dir)
+       [ "$#" -ge 2 ] || usage "'$1' option requires an argument"
+       mount_dir=$2
+       shift 2
+       ;;
+   -h | -help)
+       usage
+       ;;
+   -p | -paraview)
+       # No version specified
+       { [ "$#" -eq 1 ] || [ "$(echo "$2" | cut -c1)" = "-" ] ; } && \
+           paraview_vers=510 && \
+	   shift 1 && \
+	   continue
+       # Version specified
+       paraview_vers=$2
+       case "$paraview_vers" in
+           56|510) ;;
+           *) usage "'$2' is not a valid ParaView version." \
+		    "Valid versions are 56 | 510."
+	      ;;
+       esac
+       shift 2
+       ;;
+   -u | -upgrade)
+       upgrade=yes
+       shift
+       ;;
+   -x | -xhost)
+       custom_xauth=yes
+       shift
+       ;;
+   *)
+       usage "Invalid option '$1'"
+       ;;
+    esac
+done
+
+[ "$paraview_vers" ] && \
+    echo "Including ParaView $paraview_vers" && \
+    docker_image="openfoam/openfoam$ver-paraview$paraview_vers"
+
+
+[ -d "$mount_dir" ] || usage "No directory exists: $mount_dir"
+mount_dir=$(cd "$mount_dir" && pwd -P)
+
+[ "$mount_dir" = "$(cd "$HOME" && pwd -P)" ] && \
+    usage "Mount directory cannot be the user's home directory" \
+          "Make a subdirectory and run from there, e.g." \
+          "    mkdir -p $HOME/OpenFOAM/$(whoami)-$ver" \
+          "    $Script -d $HOME/OpenFOAM/$(whoami)-$ver"
+
+if [ -n "$custom_xauth" ]
+then
+    xauth_path="$mount_dir/.docker.xauth.$$"
+    touch "$xauth_path"
+
+    # Generate a custom X-authority file that allows any hostname
+    xauth nlist "$DISPLAY" |  sed -e 's/^..../ffff/' | \
+        xauth -f "$xauth_path" nmerge -
+
+    docker_options="-e XAUTHORITY=$xauth_path
+                    -v $xauth_path:$xauth_path
+                    --net=host"
+fi
+
+user_id=$(id -u 2> /dev/null)
+[ -n "$user_id" ] || usage "Cannot determine current user ID"
+group_id=$(id -g)
+
+home_dir='/home/openfoam'
+
+echo "Launching $0"
+echo "User: \"$(id -un)\" (ID $user_id, group ID $group_id)"
+
+ifaces=$(ifconfig | grep ^en | cut -d: -f1)
+[ "$ifaces" ] || \
+    usage "Cannot find a network interface for DISPLAY with ifconfig" \
+          "Please report an issue at http://bugs.openfoam.org" \
+          "    providing the output of the command: ifconfig"
+
+for i in $ifaces
+do
+    ip=$(ifconfig "$i" | grep inet | awk '$1=="inet" {print $2}')
+    [ "$ip" ] && break
+done
+
+[ "$ip" ] || \
+    usage "Cannot find a network IP for DISPLAY with ifconfig" \
+          "Please report an issue at https://bugs.openfoam.org" \
+          "    providing the output of the command: ifconfig"
+
+xhost + "$ip"
+
+[ "$upgrade" ] && docker pull "$docker_image"
+
+# shellcheck disable=SC2086
+echo "-e Display:" $ip:0 \
+echo "-u:" "$user_id":"$group_id" \
+echo "-v:" "$mount_dir":$home_dir \
+echo "docker_options:" $docker_options \
+echo "docker_image:" $docker_image
+
+docker run -it \
+    --rm \
+    -e DISPLAY=$ip:0 \
+    -u "$user_id":"$group_id" \
+    -v /tmp/.X11-unix:/tmp/.X11-unix \
+    -v "$mount_dir":$home_dir \
+   $docker_options \
+   $docker_image
+
+[ -n "$custom_xauth" ] && [-a -e "$xauth_path" ] && rm "$xauth_path"
